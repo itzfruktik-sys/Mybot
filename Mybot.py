@@ -1,16 +1,34 @@
-import logging
+    import logging
 import os
 import sqlite3
 import asyncio
 import random
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timedelta
-from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
+
+# --- ЖЕЛЕЗОБЕТОННЫЙ СЕРВЕР ДЛЯ RENDER ---
+# Запускается мгновенно в отдельном потоке
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 8080))
+    class DummyHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+        def log_message(self, format, *args):
+            pass # Отключаем лишний спам в логи
+    httpd = HTTPServer(('0.0.0.0', port), DummyHandler)
+    httpd.serve_forever()
+
+threading.Thread(target=run_dummy_server, daemon=True).start()
+# ----------------------------------------
 
 BOT_TOKEN = "8801581018:AAFHJOTUbwyA4j6TtxNpKCnUwl9hwHp7NY8"
 ADMIN_ID = 7987342590
@@ -20,12 +38,11 @@ REFERRAL_REWARD = 2.0
 AUTO_REF_PRICE = 10.0 
 STICKER_PROMO = "CAACAgIAAxkBAAERW9RqJwjNKVRcjbj9Sdk7ja_8TMzjDAACLFEAAucRQUmOOfnyXaFCbTsE"
 
-PORT = int(os.environ.get("PORT", 8080))
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # --- БАЗА ДАННЫХ ---
+# Теперь, если база тупит, Render нас не убьёт
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
     import psycopg2
@@ -45,18 +62,6 @@ cursor.execute(f"CREATE TABLE IF NOT EXISTS channels (channel_username {TEXT_KEY
 cursor.execute(f"CREATE TABLE IF NOT EXISTS completed_tasks (user_id BIGINT, channel_username {TEXT_KEY}, PRIMARY KEY (user_id, channel_username))")
 cursor.execute(f"CREATE TABLE IF NOT EXISTS auto_ref_queue (id {AUTOINCREMENT_KEY}, buyer_id BIGINT)")
 conn.commit()
-
-# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
-async def handle(request):
-    return web.Response(text="Bot is running!")
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
 
 # --- КЛАВИАТУРА МЕНЮ ---
 def get_main_menu():
@@ -289,7 +294,6 @@ async def send_scheduled_sticker():
         except Exception: pass
 
 async def main():
-    await start_server()
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(send_scheduled_sticker, "interval", hours=2)
     scheduler.start()
