@@ -1,9 +1,9 @@
-import logging
+    import logging
 import os
 import sqlite3
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
@@ -16,15 +16,11 @@ ADMIN_ID = 7987342590
 REQUESTS_CHAT_ID = -1003882863172
 REWARD = 0.25
 REFERRAL_REWARD = 2.0  
-DAILY_BONUS_REWARD = 1.0  
 AUTO_REF_PRICE = 10.0 
 STICKER_PROMO = "CAACAgIAAxkBAAERW9RqJwjNKVRcjbj9Sdk7ja_8TMzjDAACLFEAAucRQUmOOfnyXaFCbTsE"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-# Словарь для блокировки спама кнопками (защита от дюпа бонусов)
-bonus_lock = set()
 
 # Авто-подключение базы данных
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -43,19 +39,18 @@ else:
 cursor = conn.cursor()
 cursor.execute(f"CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance {REAL_KEY}, username {TEXT_KEY}, last_bonus {TEXT_KEY}, referrer_id BIGINT)")
 cursor.execute(f"CREATE TABLE IF NOT EXISTS channels (channel_username {TEXT_KEY} PRIMARY KEY, invite_link {TEXT_KEY}, title {TEXT_KEY})")
-cursor.execute(f"CREATE TABLE IF NOT EXISTS completed_tasks (user_id BIGINT, channel_username {TEXT_KEY}, PRIMARY KEY (user_id, channel_username))")
+cursor.execute(f"CREATE TABLE IF NOT EXISTS completed_tasks (user_id BIGINT, channel_username {TEXT_KEY} PRIMARY KEY (user_id, channel_username))")
 cursor.execute(f"CREATE TABLE IF NOT EXISTS auto_ref_queue (id {AUTOINCREMENT_KEY}, buyer_id BIGINT)")
 conn.commit()
 
 def get_main_menu():
     builder = ReplyKeyboardBuilder()
     builder.button(text="🎯 Заработать")
-    builder.button(text="🎁 Бонус")
     builder.button(text="💰 Баланс")
     builder.button(text="🎰 Игры")
     builder.button(text="🏪 Магазин") 
     builder.button(text="💳 Вывод")
-    builder.adjust(2, 2, 2)
+    builder.adjust(2, 2, 1)
     return builder.as_markup(resize_keyboard=True)
 
 @dp.message(Command("start"))
@@ -88,63 +83,18 @@ async def start(message: types.Message, command: CommandObject):
             cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + ? WHERE user_id = ?", (REFERRAL_REWARD, referrer_id))
             conn.commit()
             try:
-                await bot.send_message(chat_id=referrer_id, text=f"👥 **Система Рефералов!**\nК тебе привязан новый реферал: @{username}.\nНачислено: **{REFERRAL_REWARD} ⭐**")
+                await bot.send_message(chat_id=referrer_id, text=f"👥 **Система Рефералов!**\nК тебе привязан новый реферал: @{username}.\nНачислено: **{REFERRAL_REWARD} ⭐**", parse_mode="Markdown")
             except Exception: pass
     else:
         cursor.execute("UPDATE users SET username = %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
         conn.commit()
     await message.answer("Привет! Выбирай действие в меню:", reply_markup=get_main_menu())
 
-@dp.message(F.text == "🎁 Бонус")
-async def get_daily_bonus(message: types.Message):
-    user_id = message.from_user.id
-    
-    # Защита от бешеного флуда кнопкой
-    if user_id in bonus_lock:
-        return
-        
-    bonus_lock.add(user_id)
-    
-    try:
-        cursor.execute("SELECT last_bonus FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT last_bonus FROM users WHERE user_id = ?", (user_id,))
-        res = cursor.fetchone()
-        now = datetime.utcnow()
-        
-        if res and res[0]:
-            # Распознаем дату из PostgreSQL или SQLite железно
-            if isinstance(res[0], datetime):
-                last_bonus_time = res[0].replace(tzinfo=None)
-            else:
-                date_str = str(res[0]).split('.')[0].split('+')[0].strip()
-                last_bonus_time = datetime.fromisoformat(date_str)
-                
-            if now - last_bonus_time < timedelta(hours=24):
-                time_left = timedelta(hours=24) - (now - last_bonus_time)
-                hours, remainder = divmod(int(time_left.total_seconds()), 3600)
-                minutes, _ = divmod(remainder, 60)
-                await message.answer(f"❌ Вы уже забирали бонус!\n⏳ Новый бонус через: **{hours}ч. {minutes}мин.**", parse_mode="Markdown")
-                return
-                
-        # Чистая запись времени без косяков с часовыми поясами
-        now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
-        cursor.execute("UPDATE users SET balance = balance + %s, last_bonus = %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + ?, last_bonus = ? WHERE user_id = ?", (DAILY_BONUS_REWARD, now_str, user_id))
-        conn.commit()
-        await message.answer(f"🎁 **Бонус получен!**\n💰 Зачислено: **{DAILY_BONUS_REWARD} ⭐**")
-        
-    except Exception as e:
-        logging.error(f"Ошибка в блоке бонуса: {e}")
-        await message.answer("⚠ Произошла ошибка базы данных. Попробуй ещё раз чуть позже.")
-        
-    finally:
-        # Снимаем блок при любом исходе запроса
-        if user_id in bonus_lock:
-            bonus_lock.remove(user_id)
-
 @dp.message(F.text == "🏪 Магазин")
 async def store_menu(message: types.Message):
     builder = InlineKeyboardBuilder()
     builder.button(text="🛒 Купить Авто-Реферала (10 ⭐)", callback_data="buy_auto_ref")
-    await message.answer("🏪 **Магазин Бота**\n\n🔥 **Товар: Авто-Реферал**\n• Стоимость: **10 ⭐**\n• Описание: Следующий свободный юзер станет твоим рефералом!", reply_markup=builder.as_markup())
+    await message.answer("🏪 **Магазин Бота**\n\n🔥 **Товар: Авто-Реферал**\n• Стоимость: **10 ⭐**\n• Описание: Следующий свободный юзер станет твоим рефералом!", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "buy_auto_ref")
 async def process_buy_ref(callback: types.CallbackQuery):
@@ -157,7 +107,7 @@ async def process_buy_ref(callback: types.CallbackQuery):
     cursor.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - ? WHERE user_id = ?", (AUTO_REF_PRICE, user_id))
     cursor.execute("INSERT INTO auto_ref_queue (buyer_id) VALUES (%s)" if DATABASE_URL else "INSERT INTO auto_ref_queue (buyer_id) VALUES (?)", (user_id,))
     conn.commit()
-    await callback.message.edit_text("✅ **Успешно куплено!** Вы в очереди распределения.")
+    await callback.message.edit_text("✅ **Успешно куплено!** Вы в очереди распределения.", parse_mode="Markdown")
 
 @dp.message(F.text == "🎰 Игры")
 async def games_menu(message: types.Message):
@@ -168,7 +118,7 @@ async def games_menu(message: types.Message):
     builder.button(text="📦 Открыть Кейс (3 ⭐)", callback_data="open_case")
     builder.button(text="🏆 Топ игроков", callback_data="show_top")
     builder.adjust(2, 2, 1)
-    await message.answer("🎮 **Игровой Клуб! Все игры по 3 ⭐**", reply_markup=builder.as_markup())
+    await message.answer("🎮 **Игровой Клуб! Все игры по 3 ⭐**", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "open_case")
 async def open_case_logic(callback: types.CallbackQuery):
@@ -179,7 +129,7 @@ async def open_case_logic(callback: types.CallbackQuery):
         await callback.answer("❌ У тебя меньше 3 звёзд!", show_alert=True)
         return
     cursor.execute("UPDATE users SET balance = balance - 3 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - 3 WHERE user_id = ?", (user_id,))
-    await callback.message.edit_text("📦 *Открываем секретный кейс...*")
+    await callback.message.edit_text("📦 *Открываем секретный кейс...*", parse_mode="Markdown")
     await asyncio.sleep(1.5)
     loot = [0.0, 0.5, 1.5, 4.0, 6.0, 10.0, 15.0]
     weights = [25, 20, 20, 20, 10, 4, 1] 
@@ -189,7 +139,7 @@ async def open_case_logic(callback: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
     new_balance = cursor.fetchone()[0]
     txt = f"🔥 **ОКУП: {win_amount} ⭐!**" if win_amount > 3 else "😢 Пусто..." if win_amount == 0 else f"Выпало: {win_amount} ⭐"
-    await callback.message.answer(f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu())
+    await callback.message.answer(f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "play_darts")
 async def play_darts(callback: types.CallbackQuery):
@@ -207,7 +157,7 @@ async def play_darts(callback: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
     new_balance = cursor.fetchone()[0]
     txt = "🎯 **ЯБЛОЧКО! +6 ⭐**" if dice_msg.dice.value == 6 else "😢 **Мимо центра!**"
-    await bot.send_message(chat_id=user_id, text=f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu())
+    await bot.send_message(chat_id=user_id, text=f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "play_bowling")
 async def play_bowling(callback: types.CallbackQuery):
@@ -225,7 +175,7 @@ async def play_bowling(callback: types.CallbackQuery):
     cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
     new_balance = cursor.fetchone()[0]
     txt = "🎳 **СТРАЙК! +6 ⭐**" if dice_msg.dice.value == 6 else "😢 **Не страйк!**"
-    await bot.send_message(chat_id=user_id, text=f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu())
+    await bot.send_message(chat_id=user_id, text=f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "play_slots")
 async def play_slots_logic(callback: types.CallbackQuery):
@@ -241,7 +191,7 @@ async def play_slots_logic(callback: types.CallbackQuery):
     if dice_msg.dice.value in win_values:
         cursor.execute("UPDATE users SET balance = balance + 6 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + 6 WHERE user_id = ?", (user_id,))
         conn.commit()
-        await bot.send_message(chat_id=user_id, text="🎉 **ПОБЕДА! +6 ⭐**", reply_markup=get_main_menu())
+        await bot.send_message(chat_id=user_id, text="🎉 **ПОБЕДА! +6 ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
     else:
         await bot.send_message(chat_id=user_id, text="😢 Не повезло...", reply_markup=get_main_menu())
 
@@ -329,4 +279,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-            
+    
