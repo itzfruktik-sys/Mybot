@@ -3,58 +3,52 @@ import os
 import sqlite3
 import asyncio
 import random
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timedelta
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
-
-# --- ЖЕЛЕЗОБЕТОННЫЙ СЕРВЕР ДЛЯ RENDER ---
-# Запускается мгновенно в отдельном потоке
-def run_dummy_server():
-    port = int(os.environ.get("PORT", 8080))
-    class DummyHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Bot is alive!")
-        def log_message(self, format, *args):
-            pass # Отключаем лишний спам в логи
-    httpd = HTTPServer(('0.0.0.0', port), DummyHandler)
-    httpd.serve_forever()
-
-threading.Thread(target=run_dummy_server, daemon=True).start()
-# ----------------------------------------
 
 BOT_TOKEN = "8801581018:AAFHJOTUbwyA4j6TtxNpKCnUwl9hwHp7NY8"
 ADMIN_ID = 7987342590
 REQUESTS_CHAT_ID = -1003882863172
-REWARD = 0.25
-REFERRAL_REWARD = 2.0  
-AUTO_REF_PRICE = 10.0 
+
+# Переводим в float явно
+REWARD = float(0.25)
+REFERRAL_REWARD = float(2.0)
+AUTO_REF_PRICE = float(10.0)
 STICKER_PROMO = "CAACAgIAAxkBAAERW9RqJwjNKVRcjbj9Sdk7ja_8TMzjDAACLFEAAucRQUmOOfnyXaFCbTsE"
+
+PORT = int(os.environ.get("PORT", 8080))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# --- БАЗА ДАННЫХ ---
-# Теперь, если база тупит, Render нас не убьёт
+# --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
+conn = None
+USE_POSTGRES = False
+
 if DATABASE_URL:
-    import psycopg2
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    AUTOINCREMENT_KEY = "SERIAL PRIMARY KEY"
-    REAL_KEY = "NUMERIC DEFAULT 0.0"
-    TEXT_KEY = "TEXT"
-else:
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=5)
+        USE_POSTGRES = True
+        logging.info("Успешно подключено к PostgreSQL!")
+    except Exception as e:
+        logging.error(f"Ошибка PostgreSQL ({e}). Переключаюсь на SQLite...")
+        conn = None
+
+if not conn:
     conn = sqlite3.connect("bot_database.db", check_same_thread=False)
-    AUTOINCREMENT_KEY = "INTEGER PRIMARY KEY AUTOINCREMENT"
-    REAL_KEY = "REAL DEFAULT 0.0"
-    TEXT_KEY = "TEXT"
+    USE_POSTGRES = False
+    logging.info("Используется локальная база SQLite.")
+
+AUTOINCREMENT_KEY = "SERIAL PRIMARY KEY" if USE_POSTGRES else "INTEGER PRIMARY KEY AUTOINCREMENT"
+REAL_KEY = "NUMERIC DEFAULT 0.0" if USE_POSTGRES else "REAL DEFAULT 0.0"
+TEXT_KEY = "TEXT"
+PLACEHOLDER = "%s" if USE_POSTGRES else "?"
 
 cursor = conn.cursor()
 cursor.execute(f"CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, balance {REAL_KEY}, username {TEXT_KEY}, last_bonus {TEXT_KEY}, referrer_id BIGINT)")
@@ -62,6 +56,19 @@ cursor.execute(f"CREATE TABLE IF NOT EXISTS channels (channel_username {TEXT_KEY
 cursor.execute(f"CREATE TABLE IF NOT EXISTS completed_tasks (user_id BIGINT, channel_username {TEXT_KEY}, PRIMARY KEY (user_id, channel_username))")
 cursor.execute(f"CREATE TABLE IF NOT EXISTS auto_ref_queue (id {AUTOINCREMENT_KEY}, buyer_id BIGINT)")
 conn.commit()
+
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_server():
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logging.info(f"Веб-сервер запущен на порту {PORT}")
 
 # --- КЛАВИАТУРА МЕНЮ ---
 def get_main_menu():
@@ -79,7 +86,8 @@ def get_main_menu():
 async def start(message: types.Message, command: CommandObject):
     user_id = message.from_user.id
     username = message.from_user.username or f"id{user_id}"
-    cursor.execute("SELECT user_id FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    
+    cursor.execute(f"SELECT user_id FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
     user_exists = cursor.fetchone()
     
     if not user_exists:
@@ -95,20 +103,20 @@ async def start(message: types.Message, command: CommandObject):
             if queue_item:
                 queue_row_id, buyer_id = queue_item
                 referrer_id = buyer_id
-                cursor.execute("DELETE FROM auto_ref_queue WHERE id = %s" if DATABASE_URL else "DELETE FROM auto_ref_queue WHERE id = ?", (queue_row_id,))
+                cursor.execute(f"DELETE FROM auto_ref_queue WHERE id = {PLACEHOLDER}", (queue_row_id,))
                 conn.commit()
 
-        cursor.execute("INSERT INTO users (user_id, balance, username, referrer_id) VALUES (%s, 0.0, %s, %s)" if DATABASE_URL else "INSERT INTO users (user_id, balance, username, referrer_id) VALUES (?, 0.0, ?, ?)", (user_id, username, referrer_id))
+        cursor.execute(f"INSERT INTO users (user_id, balance, username, referrer_id) VALUES ({PLACEHOLDER}, 0.0, {PLACEHOLDER}, {PLACEHOLDER})", (user_id, username, referrer_id))
         conn.commit()
         
         if referrer_id:
-            cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + ? WHERE user_id = ?", (REFERRAL_REWARD, referrer_id))
+            cursor.execute(f"UPDATE users SET balance = balance + {PLACEHOLDER} WHERE user_id = {PLACEHOLDER}", (REFERRAL_REWARD, referrer_id))
             conn.commit()
             try:
                 await bot.send_message(chat_id=referrer_id, text=f"👥 **Система Рефералов!**\nК тебе привязан новый реферал: @{username}.\nНачислено: **{REFERRAL_REWARD} ⭐**", parse_mode="Markdown")
             except Exception: pass
     else:
-        cursor.execute("UPDATE users SET username = %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
+        cursor.execute(f"UPDATE users SET username = {PLACEHOLDER} WHERE user_id = {PLACEHOLDER}", (username, user_id))
         conn.commit()
     await message.answer("Привет! Выбирай действие в меню:", reply_markup=get_main_menu())
 
@@ -120,14 +128,15 @@ async def store_menu(message: types.Message):
 
 @dp.callback_query(F.data == "buy_auto_ref")
 async def process_buy_ref(callback: types.CallbackQuery):
+    await callback.answer()
     user_id = callback.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    balance = cursor.fetchone()[0]
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
+    balance = float(cursor.fetchone()[0])
     if balance < AUTO_REF_PRICE:
-        await callback.answer("❌ Недостаточно звёзд! Нужно 10 ⭐", show_alert=True)
+        await callback.message.answer("❌ Недостаточно звёзд! Нужно 10 ⭐")
         return
-    cursor.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - ? WHERE user_id = ?", (AUTO_REF_PRICE, user_id))
-    cursor.execute("INSERT INTO auto_ref_queue (buyer_id) VALUES (%s)" if DATABASE_URL else "INSERT INTO auto_ref_queue (buyer_id) VALUES (?)", (user_id,))
+    cursor.execute(f"UPDATE users SET balance = balance - {PLACEHOLDER} WHERE user_id = {PLACEHOLDER}", (AUTO_REF_PRICE, user_id))
+    cursor.execute(f"INSERT INTO auto_ref_queue (buyer_id) VALUES ({PLACEHOLDER})", (user_id,))
     conn.commit()
     await callback.message.edit_text("✅ **Успешно куплено!** Вы в очереди распределения.", parse_mode="Markdown")
 
@@ -144,74 +153,78 @@ async def games_menu(message: types.Message):
 
 @dp.callback_query(F.data == "open_case")
 async def open_case_logic(callback: types.CallbackQuery):
+    await callback.answer()
     user_id = callback.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    balance = cursor.fetchone()[0]
-    if balance < 3:
-        await callback.answer("❌ У тебя меньше 3 звёзд!", show_alert=True)
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
+    balance = float(cursor.fetchone()[0])
+    if balance < 3.0:
+        await callback.message.answer("❌ У тебя меньше 3 звёзд!")
         return
-    cursor.execute("UPDATE users SET balance = balance - 3 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - 3 WHERE user_id = ?", (user_id,))
+    cursor.execute(f"UPDATE users SET balance = balance - 3.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
     await callback.message.edit_text("📦 *Открываем секретный кейс...*", parse_mode="Markdown")
     await asyncio.sleep(1.5)
     loot = [0.0, 0.5, 1.5, 4.0, 6.0, 10.0, 15.0]
     weights = [25, 20, 20, 20, 10, 4, 1] 
-    win_amount = random.choices(loot, weights=weights)[0]
-    cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + ? WHERE user_id = ?", (win_amount, user_id))
+    win_amount = float(random.choices(loot, weights=weights)[0])
+    cursor.execute(f"UPDATE users SET balance = balance + {PLACEHOLDER} WHERE user_id = {PLACEHOLDER}", (win_amount, user_id))
     conn.commit()
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
     new_balance = cursor.fetchone()[0]
-    txt = f"🔥 **ОКУП: {win_amount} ⭐!**" if win_amount > 3 else "😢 Пусто..." if win_amount == 0 else f"Выпало: {win_amount} ⭐"
+    txt = f"🔥 **ОКУП: {win_amount} ⭐!**" if win_amount > 3.0 else "😢 Пусто..." if win_amount == 0.0 else f"Выпало: {win_amount} ⭐"
     await callback.message.answer(f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "play_darts")
 async def play_darts(callback: types.CallbackQuery):
+    await callback.answer()
     user_id = callback.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    if cursor.fetchone()[0] < 3: return
-    cursor.execute("UPDATE users SET balance = balance - 3 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - 3 WHERE user_id = ?", (user_id,))
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
+    if float(cursor.fetchone()[0]) < 3.0: return
+    cursor.execute(f"UPDATE users SET balance = balance - 3.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
     conn.commit()
     await callback.message.delete()
     dice_msg = await bot.send_dice(chat_id=user_id, emoji="🎯")
     await asyncio.sleep(2.0)
     if dice_msg.dice.value == 6:
-        cursor.execute("UPDATE users SET balance = balance + 6 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + 6 WHERE user_id = ?", (user_id,))
+        cursor.execute(f"UPDATE users SET balance = balance + 6.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
     conn.commit()
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
     new_balance = cursor.fetchone()[0]
     txt = "🎯 **ЯБЛОЧКО! +6 ⭐**" if dice_msg.dice.value == 6 else "😢 **Мимо центра!**"
     await bot.send_message(chat_id=user_id, text=f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "play_bowling")
 async def play_bowling(callback: types.CallbackQuery):
+    await callback.answer()
     user_id = callback.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    if cursor.fetchone()[0] < 3: return
-    cursor.execute("UPDATE users SET balance = balance - 3 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - 3 WHERE user_id = ?", (user_id,))
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
+    if float(cursor.fetchone()[0]) < 3.0: return
+    cursor.execute(f"UPDATE users SET balance = balance - 3.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
     conn.commit()
     await callback.message.delete()
     dice_msg = await bot.send_dice(chat_id=user_id, emoji="🎳")
     await asyncio.sleep(2.0)
     if dice_msg.dice.value == 6:
-        cursor.execute("UPDATE users SET balance = balance + 6 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + 6 WHERE user_id = ?", (user_id,))
+        cursor.execute(f"UPDATE users SET balance = balance + 6.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
     conn.commit()
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
     new_balance = cursor.fetchone()[0]
     txt = "🎳 **СТРАЙК! +6 ⭐**" if dice_msg.dice.value == 6 else "😢 **Не страйк!**"
     await bot.send_message(chat_id=user_id, text=f"{txt}\n👤 Баланс: **{round(new_balance, 2)} ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
 
 @dp.callback_query(F.data == "play_slots")
 async def play_slots_logic(callback: types.CallbackQuery):
+    await callback.answer()
     user_id = callback.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    if cursor.fetchone()[0] < 3: return
-    cursor.execute("UPDATE users SET balance = balance - 3 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - 3 WHERE user_id = ?", (user_id,))
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
+    if float(cursor.fetchone()[0]) < 3.0: return
+    cursor.execute(f"UPDATE users SET balance = balance - 3.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
     conn.commit()
     await callback.message.delete()
     dice_msg = await bot.send_dice(chat_id=user_id, emoji="🎰")
     win_values = [1, 22, 43, 64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 17, 18, 32, 33, 34, 48, 49, 50] 
     await asyncio.sleep(2.5)
     if dice_msg.dice.value in win_values:
-        cursor.execute("UPDATE users SET balance = balance + 6 WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + 6 WHERE user_id = ?", (user_id,))
+        cursor.execute(f"UPDATE users SET balance = balance + 6.0 WHERE user_id = {PLACEHOLDER}", (user_id,))
         conn.commit()
         await bot.send_message(chat_id=user_id, text="🎉 **ПОБЕДА! +6 ⭐**", reply_markup=get_main_menu(), parse_mode="Markdown")
     else:
@@ -219,6 +232,7 @@ async def play_slots_logic(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "show_top")
 async def show_top_players(callback: types.CallbackQuery):
+    await callback.answer()
     cursor.execute("SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10")
     leaders = cursor.fetchall()
     top_text = "🏆 **ТОП-10 ИГРОКОВ** 🏆\n\n"
@@ -231,13 +245,14 @@ async def show_top_players(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_games")
 async def back_games(callback: types.CallbackQuery):
+    await callback.answer()
     await callback.message.delete()
     await games_menu(callback.message)
 
 @dp.message(F.text == "🎯 Заработать")
 async def earn(message: types.Message):
     user_id = message.from_user.id
-    cursor.execute("SELECT channel_username, invite_link, title FROM channels WHERE channel_username NOT IN (SELECT channel_username FROM completed_tasks WHERE user_id = %s) LIMIT 1" if DATABASE_URL else "SELECT channel_username, invite_link, title FROM channels WHERE channel_username NOT IN (SELECT channel_username FROM completed_tasks WHERE user_id = ?) LIMIT 1", (user_id,))
+    cursor.execute(f"SELECT channel_username, invite_link, title FROM channels WHERE channel_username NOT IN (SELECT channel_username FROM completed_tasks WHERE user_id = {PLACEHOLDER}) LIMIT 1", (user_id,))
     channel = cursor.fetchone()
     if not channel:
         await message.answer("Пока нет заданий.")
@@ -249,20 +264,33 @@ async def earn(message: types.Message):
 
 @dp.callback_query(F.data.startswith("check_"))
 async def check(callback: types.CallbackQuery):
+    # Самое важное: сразу гасим часики анимации нажатия кнопкой
+    await callback.answer("Проверяем подписку...", show_alert=False)
+    
     user_id = callback.from_user.id
     channel = callback.data.split("_")[1]
-    cursor.execute("SELECT 1 FROM completed_tasks WHERE user_id = %s AND channel_username = %s" if DATABASE_URL else "SELECT 1 FROM completed_tasks WHERE user_id = ? AND channel_username = ?", (user_id, channel))
-    if cursor.fetchone(): return
-    cursor.execute("UPDATE users SET balance = balance + %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance + ? WHERE user_id = ?", (REWARD, user_id))
-    cursor.execute("INSERT INTO completed_tasks VALUES (%s, %s)" if DATABASE_URL else "INSERT OR IGNORE INTO completed_tasks VALUES (?, ?)", (user_id, channel))
+    
+    cursor.execute(f"SELECT 1 FROM completed_tasks WHERE user_id = {PLACEHOLDER} AND channel_username = {PLACEHOLDER}", (user_id, channel))
+    if cursor.fetchone(): 
+        await callback.message.edit_text("Вы уже выполнили это задание!")
+        return
+        
+    # Прямое начисление float значения
+    cursor.execute(f"UPDATE users SET balance = balance + {PLACEHOLDER} WHERE user_id = {PLACEHOLDER}", (REWARD, user_id))
+    
+    if USE_POSTGRES:
+        cursor.execute("INSERT INTO completed_tasks VALUES (%s, %s) ON CONFLICT DO NOTHING", (user_id, channel))
+    else:
+        cursor.execute("INSERT OR IGNORE INTO completed_tasks VALUES (?, ?)", (user_id, channel))
+        
     conn.commit()
     await callback.message.edit_text("🎉 Награда зачислена!")
 
 @dp.message(F.text == "💰 Баланс")
 async def check_balance(message: types.Message):
     user_id = message.from_user.id
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
-    current_balance = cursor.fetchone()[0]
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
+    current_balance = float(cursor.fetchone()[0])
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
     await message.answer(f"💰 Баланс: **{round(current_balance, 2)} ⭐**\n🔗 Реф. ссылка:\n`{ref_link}`", parse_mode="Markdown")
@@ -276,27 +304,34 @@ async def withdraw_menu(message: types.Message):
 
 @dp.callback_query(F.data.startswith("withdraw_"))
 async def process_withdraw(callback: types.CallbackQuery):
+    await callback.answer()
     user_id = callback.from_user.id
-    amount = int(callback.data.split("_")[1])
-    cursor.execute("SELECT balance FROM users WHERE user_id = %s" if DATABASE_URL else "SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    amount = float(callback.data.split("_")[1])
+    cursor.execute(f"SELECT balance FROM users WHERE user_id = {PLACEHOLDER}", (user_id,))
     res = cursor.fetchone()
-    if not res or res[0] < amount: return
-    cursor.execute("UPDATE users SET balance = balance - %s WHERE user_id = %s" if DATABASE_URL else "UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, user_id))
+    if not res or float(res[0]) < amount: 
+        await callback.message.answer("❌ Недостаточно средств для вывода!")
+        return
+    cursor.execute(f"UPDATE users SET balance = balance - {PLACEHOLDER} WHERE user_id = {PLACEHOLDER}", (amount, user_id))
     conn.commit()
     await callback.message.edit_text("✅ Заявка создана!")
     await bot.send_message(chat_id=REQUESTS_CHAT_ID, text=f"🔔 Заявка: {amount} ⭐ от @{callback.from_user.username}")
 
-async def send_scheduled_sticker():
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    for user in users:
-        try: await bot.send_sticker(chat_id=user[0], sticker=STICKER_PROMO)
-        except Exception: pass
+async def scheduled_sticker_loop():
+    while True:
+        await asyncio.sleep(7200)
+        try:
+            cursor.execute("SELECT user_id FROM users")
+            users = cursor.fetchall()
+            for user in users:
+                try: await bot.send_sticker(chat_id=user[0], sticker=STICKER_PROMO)
+                except Exception: pass
+        except Exception as e:
+            logging.error(f"Ошибка рассылки: {e}")
 
 async def main():
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(send_scheduled_sticker, "interval", hours=2)
-    scheduler.start()
+    await start_server()
+    asyncio.create_task(scheduled_sticker_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
